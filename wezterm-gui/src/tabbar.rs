@@ -1,5 +1,5 @@
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
-use config::{ConfigHandle, TabBarColors};
+use config::{ConfigHandle, TabBarColors, TabBarPosition};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
@@ -18,12 +18,13 @@ pub struct TabBarState {
     items: Vec<TabEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabBarItem {
     None,
     LeftStatus,
     RightStatus,
     Tab { tab_idx: usize, active: bool },
+    Workspace { workspace: String, active: bool },
     NewTabButton,
     WindowButton(IntegratedTitleButton),
 }
@@ -153,7 +154,11 @@ fn compute_tab_title(
                     tab.tab_title.clone()
                 };
 
-                let classic_spacing = if config.use_fancy_tab_bar { "" } else { " " };
+                let classic_spacing = if effective_use_fancy_tab_bar(config) {
+                    ""
+                } else {
+                    " "
+                };
                 if config.show_tab_index_in_tab_bar {
                     let index = format!(
                         "{classic_spacing}{}: ",
@@ -193,7 +198,7 @@ fn compute_tab_title(
                 // easier to click on tab titles, but we'll still go below
                 // this if there are too many tabs to fit the window at
                 // this width.
-                if !config.use_fancy_tab_bar {
+                if !effective_use_fancy_tab_bar(config) {
                     while len + unicode_column_width(&title, None) < 5 {
                         title.push(' ');
                     }
@@ -216,6 +221,10 @@ fn is_tab_hover(mouse_x: Option<usize>, x: usize, tab_title_len: usize) -> bool 
     return mouse_x
         .map(|mouse_x| mouse_x >= x && mouse_x < x + tab_title_len)
         .unwrap_or(false);
+}
+
+fn effective_use_fancy_tab_bar(config: &ConfigHandle) -> bool {
+    config.use_fancy_tab_bar || config.resolved_tab_bar_position().is_vertical()
 }
 
 impl TabBarState {
@@ -247,13 +256,13 @@ impl TabBarState {
         line: &mut Line,
         colors: &TabBarColors,
     ) {
-        let default_cell = if config.use_fancy_tab_bar {
+        let default_cell = if effective_use_fancy_tab_bar(config) {
             CellAttributes::default()
         } else {
             colors.new_tab().as_cell_attributes()
         };
 
-        let default_cell_hover = if config.use_fancy_tab_bar {
+        let default_cell_hover = if effective_use_fancy_tab_bar(config) {
             CellAttributes::default()
         } else {
             colors.new_tab_hover().as_cell_attributes()
@@ -334,6 +343,8 @@ impl TabBarState {
         title_width: usize,
         mouse_x: Option<usize>,
         tab_info: &[TabInformation],
+        workspaces: &[String],
+        active_workspace: &str,
         pane_info: &[PaneInformation],
         colors: Option<&TabBarColors>,
         config: &ConfigHandle,
@@ -350,7 +361,7 @@ impl TabBarState {
 
         let new_tab = parse_status_text(
             &config.tab_bar_style.new_tab,
-            if config.use_fancy_tab_bar {
+            if effective_use_fancy_tab_bar(config) {
                 CellAttributes::default()
             } else {
                 new_tab_attrs.clone()
@@ -358,7 +369,7 @@ impl TabBarState {
         );
         let new_tab_hover = parse_status_text(
             &config.tab_bar_style.new_tab_hover,
-            if config.use_fancy_tab_bar {
+            if effective_use_fancy_tab_bar(config) {
                 CellAttributes::default()
             } else {
                 new_tab_hover_attrs.clone()
@@ -402,7 +413,8 @@ impl TabBarState {
 
         let available_cells =
             title_width.saturating_sub(number_of_tabs.saturating_sub(1) + new_tab.len());
-        let tab_width_max = if config.use_fancy_tab_bar || available_cells >= titles_len {
+        let tab_width_max = if effective_use_fancy_tab_bar(config) || available_cells >= titles_len
+        {
             // We can render each title with its full width
             usize::max_value()
         } else {
@@ -422,10 +434,22 @@ impl TabBarState {
                 .clone(),
         );
 
+        if config.resolved_tab_bar_position().is_vertical() {
+            return Self::new_vertical(
+                title_width,
+                tab_info,
+                workspaces,
+                active_workspace,
+                pane_info,
+                config,
+                new_tab,
+            );
+        }
+
         if use_integrated_title_buttons
             && config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
-            && config.use_fancy_tab_bar == false
-            && config.tab_bar_at_bottom == false
+            && !effective_use_fancy_tab_bar(config)
+            && config.resolved_tab_bar_position() == TabBarPosition::Top
         {
             for _ in 0..10 as usize {
                 line.insert_cell(0, black_cell.clone(), title_width, SEQ_ZERO);
@@ -481,7 +505,7 @@ impl TabBarState {
             let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
             let mut tab_line = parse_status_text(
                 &esc,
-                if config.use_fancy_tab_bar {
+                if effective_use_fancy_tab_bar(config) {
                     CellAttributes::default()
                 } else {
                     cell_attrs.clone()
@@ -606,6 +630,71 @@ impl TabBarState {
         Self { line, items }
     }
 
+    fn new_vertical(
+        title_width: usize,
+        tab_info: &[TabInformation],
+        workspaces: &[String],
+        active_workspace: &str,
+        pane_info: &[PaneInformation],
+        config: &ConfigHandle,
+        new_tab: Line,
+    ) -> Self {
+        let mut line = Line::with_width(0, SEQ_ZERO);
+        let mut items = vec![];
+
+        for workspace in workspaces {
+            let active = workspace == active_workspace;
+            let title = parse_status_text(workspace, CellAttributes::default());
+            line.append_line(title.clone(), SEQ_ZERO);
+            items.push(TabEntry {
+                item: TabBarItem::Workspace {
+                    workspace: workspace.clone(),
+                    active,
+                },
+                title,
+                x: 0,
+                width: title_width,
+            });
+
+            if active && config.show_tabs_in_tab_bar {
+                for tab in tab_info {
+                    let tab_title = compute_tab_title(
+                        tab,
+                        tab_info,
+                        pane_info,
+                        config,
+                        false,
+                        config.tab_max_width,
+                    );
+                    let esc = format_as_escapes(tab_title.items).expect("already parsed ok above");
+                    let title = parse_status_text(&esc, CellAttributes::default());
+                    line.append_line(title.clone(), SEQ_ZERO);
+                    items.push(TabEntry {
+                        item: TabBarItem::Tab {
+                            tab_idx: tab.tab_index,
+                            active: tab.is_active,
+                        },
+                        title,
+                        x: 0,
+                        width: title_width,
+                    });
+                }
+            }
+
+            if active && config.show_new_tab_button_in_tab_bar {
+                line.append_line(new_tab.clone(), SEQ_ZERO);
+                items.push(TabEntry {
+                    item: TabBarItem::NewTabButton,
+                    title: new_tab.clone(),
+                    x: 0,
+                    width: title_width,
+                });
+            }
+        }
+
+        Self { line, items }
+    }
+
     pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
         let mut items = vec![];
 
@@ -615,7 +704,7 @@ impl TabBarState {
                 width: entry.width * cell_width,
                 y,
                 height: cell_height,
-                item_type: UIItemType::TabBar(entry.item),
+                item_type: UIItemType::TabBar(entry.item.clone()),
             });
         }
 
